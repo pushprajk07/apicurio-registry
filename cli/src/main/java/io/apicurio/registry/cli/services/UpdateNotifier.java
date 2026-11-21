@@ -7,6 +7,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.format.DateTimeParseException;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import org.jboss.logging.Logger;
 
@@ -90,8 +91,14 @@ public class UpdateNotifier {
                 }
             }
 
-            if (isBackingOffAfterFailure(props)) {
-                return false;
+            var failureRetryAt = failureRetryAt(props);
+            if (failureRetryAt.isPresent()) {
+                if (Instant.now().isBefore(failureRetryAt.get())) {
+                    log.debugf("Update check skipped: previous check failed, next attempt at %s",
+                            failureRetryAt.get());
+                    return false;
+                }
+                return true;
             }
 
             var lastCheck = props.get(Update.CONFIG_LAST_CHECK);
@@ -112,16 +119,25 @@ public class UpdateNotifier {
     }
 
     /**
-     * Reports whether the previous check failed recently enough that the next one should be skipped.
+     * Returns when the next check is due after a failed one, or empty if no failure is recorded.
      * <p>
      * Without this, a check that fails is never recorded, so the auto-check hook retries it on every
      * single command: a persistent problem (an unreachable repository, no network, a proxy) costs a
      * network attempt and two lines of output every time the user runs anything.
+     * <p>
+     * A successful check clears the failure record, so a recorded failure always belongs to the most
+     * recent check. When one is present, the time returned here alone decides when to retry: the
+     * daily interval is not applied on top of it, because {@code internal.update.last-check} then
+     * belongs to an older successful check and would hold the retry back for up to a day.
+     * <p>
+     * A timestamp that cannot be parsed, or a count that is not a positive number, is treated as no
+     * failure recorded, so the daily interval applies as usual.
      */
-    private boolean isBackingOffAfterFailure(Map<String, String> props) {
+    private Optional<Instant> failureRetryAt(Map<String, String> props) {
         var lastFailure = props.get(Update.CONFIG_LAST_FAILURE);
-        if (lastFailure == null) {
-            return false;
+        var failureCount = parseFailureCount(props.get(Update.CONFIG_FAILURE_COUNT));
+        if (lastFailure == null || failureCount == 0) {
+            return Optional.empty();
         }
         Instant failedAt;
         try {
@@ -130,14 +146,9 @@ public class UpdateNotifier {
             // Parsed defensively on purpose: an unreadable marker must not disable update checks
             // permanently, which is what letting this propagate to the caller's catch would do.
             log.debugf("Ignoring unparseable update failure timestamp: %s", lastFailure);
-            return false;
+            return Optional.empty();
         }
-        var retryAt = failedAt.plus(failureBackoff(parseFailureCount(props.get(Update.CONFIG_FAILURE_COUNT))));
-        if (Instant.now().isBefore(retryAt)) {
-            log.debugf("Update check skipped: previous check failed, next attempt at %s", retryAt);
-            return true;
-        }
-        return false;
+        return Optional.of(failedAt.plus(failureBackoff(failureCount)));
     }
 
     /**

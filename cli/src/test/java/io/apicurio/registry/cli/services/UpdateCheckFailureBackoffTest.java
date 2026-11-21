@@ -250,6 +250,56 @@ public class UpdateCheckFailureBackoffTest {
     }
 
     @Test
+    void testExpiredBackoffRetriesEvenAfterARecentSuccessfulCheck(@TempDir Path tempDir)
+            throws IOException {
+        wireMock.stubFor(get(urlEqualTo("/maven-metadata.xml"))
+                .willReturn(aResponse().withStatus(200).withBody(METADATA_XML)));
+        var now = Instant.now();
+        useHome(tempDir, Map.of(
+                REPO_URL_KEY, wireMock.baseUrl(),
+                LAST_CHECK_KEY, now.minus(Duration.ofMinutes(20)).toString(),
+                FAILURE_COUNT_KEY, "1",
+                LAST_FAILURE_KEY, now.minus(Duration.ofMinutes(16)).toString()));
+        var err = new StringBuilder();
+        config.setStdErr(err::append);
+
+        updateNotifier.checkAndNotify("artifact");
+
+        assertThat(err.toString()).contains("Checking for updates...");
+        assertThat(wireMock.getAllServeEvents())
+                .as("A check succeeded 20 minutes ago and the next one failed 16 minutes ago. The "
+                        + "15-minute backoff has expired, so the retry is due even though the "
+                        + "successful check is far less than a day old")
+                .hasSize(1);
+        var props = config.read().getConfig();
+        assertThat(props.get(FAILURE_COUNT_KEY))
+                .as("The retry succeeded, so the failure streak is over")
+                .isNull();
+        assertThat(props.get(LAST_FAILURE_KEY)).isNull();
+    }
+
+    @Test
+    void testUnreadableFailureCountLeavesTheDailyIntervalInCharge(@TempDir Path tempDir)
+            throws IOException {
+        var now = Instant.now();
+        useHome(tempDir, Map.of(
+                REPO_URL_KEY, wireMock.baseUrl(),
+                LAST_CHECK_KEY, now.minus(Duration.ofHours(1)).toString(),
+                FAILURE_COUNT_KEY, "not-a-number",
+                LAST_FAILURE_KEY, now.minus(Duration.ofMinutes(30)).toString()));
+        var err = new StringBuilder();
+        config.setStdErr(err::append);
+
+        updateNotifier.checkAndNotify("artifact");
+
+        assertThat(wireMock.getAllServeEvents())
+                .as("A count that cannot be read means no failure is recorded, so the successful "
+                        + "check an hour ago keeps the next one a day away")
+                .isEmpty();
+        assertThat(err.toString()).isEmpty();
+    }
+
+    @Test
     void testUnparseableFailureTimestampDoesNotDisableCheckingForGood(@TempDir Path tempDir)
             throws IOException {
         wireMock.stubFor(get(urlEqualTo("/maven-metadata.xml"))
